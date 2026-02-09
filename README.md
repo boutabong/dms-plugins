@@ -56,7 +56,6 @@ Monitor active SSH, SFTP, FTP, and Yazi VFS connections with hostname resolution
 **Dependencies**
 - fish
 - procps-ng
-- net-tools
 
 ---
 
@@ -64,7 +63,8 @@ Monitor active SSH, SFTP, FTP, and Yazi VFS connections with hostname resolution
 
 Toggle niri screenshot mode between saving to disk and clipboard only.
 
-![Screenshot Toggle](screenshots/screenshot-toggle-control-center.png)
+![Screenshot Toggle On](screenshots/screenshot-toggle-control-center.png)
+![Screenshot Toggle Off](screenshots/screenshot-toggle-control-center-off.png)
 
 **Features**
 - Control center widget
