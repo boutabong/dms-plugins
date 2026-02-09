@@ -1,0 +1,14 @@
+{
+    "id": "screenshotToggle",
+    "name": "Screenshot Toggle",
+    "capabilities": ["control-center"],
+    "category": "utilities",
+    "repo": "https://github.com/boutabong/dms-plugins",
+    "path": "ScreenShot-Toggle",
+    "author": "Deppes",
+    "description": "Toggle niri screenshot mode between disk save and clipboard only",
+    "dependencies": [],
+    "compositors": ["niri"],
+    "distro": ["arch"],
+    "screenshot": "https://raw.githubusercontent.com/boutabong/dms-plugins/main/screenshots/screenshot-toggle-control-center.png"
+}

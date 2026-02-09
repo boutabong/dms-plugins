@@ -9,5 +9,6 @@
     "description": "Monitor active SSH, SFTP, FTP, and Yazi VFS connections with hostname resolution",
     "dependencies": ["fish", "procps-ng", "net-tools"],
     "compositors": ["niri"],
-    "distro": ["arch"]
+    "distro": ["arch"],
+    "screenshot": "https://raw.githubusercontent.com/boutabong/dms-plugins/main/screenshots/sshmonitor-popout.png"
 }
