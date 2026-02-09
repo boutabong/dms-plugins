@@ -7,8 +7,8 @@
     "path": "SSH-Monitor",
     "author": "Deppes",
     "description": "Monitor active SSH, SFTP, FTP, and Yazi VFS connections with hostname resolution",
-    "dependencies": ["fish", "procps-ng", "net-tools"],
+    "dependencies": ["fish", "procps-ng"],
     "compositors": ["niri"],
     "distro": ["arch"],
-    "screenshot": "https://raw.githubusercontent.com/boutabong/dms-plugins/main/screenshots/sshmonitor-popout.png"
+    "screenshot": "https://raw.githubusercontent.com/boutabong/dms-plugins/master/screenshots/sshmonitor-popout.png"
 }

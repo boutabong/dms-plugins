@@ -10,5 +10,5 @@
     "dependencies": ["curl", "jq", "fish", "libnotify", "xdg-utils"],
     "compositors": ["niri"],
     "distro": ["arch"],
-    "screenshot": "https://raw.githubusercontent.com/boutabong/dms-plugins/main/screenshots/GitHubHeatMap-popout.png"
+    "screenshot": "https://raw.githubusercontent.com/boutabong/dms-plugins/master/screenshots/GitHubHeatMap-popout.png"
 }
