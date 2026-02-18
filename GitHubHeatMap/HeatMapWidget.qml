@@ -22,7 +22,6 @@ PluginComponent {
 
     // Settings from pluginData
     property string githubUsername: (pluginData && pluginData.username) ? pluginData.username : ""
-    property string githubPAT: (pluginData && pluginData.pat) ? pluginData.pat : ""
     property int refreshInterval: (pluginData && pluginData.refreshInterval) ? pluginData.refreshInterval : 300
 
     // State - Always 7 items for fixed width
@@ -41,7 +40,7 @@ PluginComponent {
 
         // Start timer if credentials present
         Qt.callLater(function() {
-            if (githubUsername && githubPAT) {
+            if (githubUsername) {
                 refreshTimer.start()
             }
         })
@@ -49,7 +48,6 @@ PluginComponent {
 
     // Watch for credential changes
     onGithubUsernameChanged: checkAndStartTimer()
-    onGithubPATChanged: checkAndStartTimer()
     onRefreshIntervalChanged: {
         if (refreshTimer.running) {
             refreshTimer.restart()
@@ -57,7 +55,7 @@ PluginComponent {
     }
 
     function checkAndStartTimer() {
-        if (githubUsername && githubPAT) {
+        if (githubUsername) {
             if (!refreshTimer.running) {
                 refreshTimer.start()
             }
@@ -120,28 +118,28 @@ PluginComponent {
         running: false
         triggeredOnStart: true
         onTriggered: {
-            if (root.githubUsername && root.githubPAT) {
+            if (root.githubUsername) {
                 root.isManualRefresh = false  // Automatic refresh
                 root.refreshHeatmap()
             } else {
                 root.isError = true
-                root.errorMessage = "Configure GitHub credentials in settings"
+                root.errorMessage = "Configure GitHub username in settings"
             }
         }
     }
 
     // Refresh function
     function refreshHeatmap() {
-        if (!githubUsername || !githubPAT) {
+        if (!githubUsername) {
             isError = true
-            errorMessage = "Configure GitHub credentials in settings"
+            errorMessage = "Configure GitHub username in settings"
             return
         }
 
         // Cooldown: prevent refreshes within 30 seconds of last refresh
         const now = Date.now()
         if (lastRefreshTime && (now - lastRefreshTime) < 30000) {
-            console.log("GitHub: Skipping refresh (cooldown active, last refresh was", Math.floor((now - lastRefreshTime) / 1000), "seconds ago)")
+            console.log("GitHub: Skipping refresh (cooldown active)")
             return
         }
 
@@ -151,254 +149,166 @@ PluginComponent {
         githubProcess.running = true
     }
 
-    // Build the embedded Fish script with escaped credentials
+    // Build the embedded Bash script
     function buildScript() {
         const escapedUsername = escapeShellString(githubUsername)
-        const escapedPAT = escapeShellString(githubPAT)
 
+        // NOTE: We must escape ${} as \${} to prevent JS interpolation
         return `
-# GitHub Heatmap Fetcher
-set GITHUB_USERNAME "${escapedUsername}"
-set GITHUB_PAT "${escapedPAT}"
+# GitHub Heatmap Fetcher (Bash + Public API)
+GITHUB_USERNAME="${escapedUsername}"
 
 # GitHub contribution color scheme (dark theme)
-set COLOR_0 "#202329"
-set COLOR_1 "#0e4429"
-set COLOR_2 "#006d32"
-set COLOR_3 "#26a641"
-set COLOR_4 "#39d353"
+COLOR_0="#202329"
+COLOR_1="#0e4429"
+COLOR_2="#006d32"
+COLOR_3="#26a641"
+COLOR_4="#39d353"
 
-# Calculate date range (4 weeks, aligned to Sunday)
-set today (date +%Y-%m-%d)
-set today_dow (date -d "$today" +%u)  # 1=Mon, 7=Sun
+# 1. Calculate date range
+today=$(date +%Y-%m-%d)
+today_dow=$(date -d "$today" +%u)
 
-# Find the Sunday of current week
-if test "$today_dow" = "7"
-    set current_sunday "$today"
+if [ "$today_dow" = "7" ]; then
+    current_sunday="$today"
 else
-    set current_sunday (date -d "$today -$today_dow days" +%Y-%m-%d)
-end
+    current_sunday=$(date -d "$today -$today_dow days" +%Y-%m-%d)
+fi
 
-# Go back 7 more weeks to get 8 weeks total (starting Sunday)
-set start_date (date -d "$current_sunday -49 days" +%Y-%m-%d)
-set from_date "$start_date"T00:00:00Z
-set to_date "$today"T23:59:59Z
+start_date=$(date -d "$current_sunday -49 days" +%Y-%m-%d)
+today_timestamp=$(date -d "$today" +%s)
 
-# GraphQL query
-set query 'query($user: String!, $from: DateTime!, $to: DateTime!) {
-  user(login: $user) {
-    contributionsCollection(from: $from, to: $to) {
-      contributionCalendar {
-        weeks {
-          contributionDays {
-            date
-            contributionCount
-            weekday
-          }
-        }
-      }
-    }
-  }
-}'
+# 2. Fetch Data (Public API)
+url="https://github-contributions-api.jogruber.de/v4/$GITHUB_USERNAME?y=last"
 
-# Escape query for JSON
-set query_escaped (echo $query | tr -d '\\n' | sed 's/"/\\\\"/g')
+temp_response=$(mktemp)
+http_code=$(curl -s -w "%{http_code}" -o "$temp_response" "$url")
+body=$(cat "$temp_response")
+rm -f "$temp_response"
 
-# Build JSON payload
-set payload '{"query":"'$query_escaped'","variables":{"user":"'$GITHUB_USERNAME'","from":"'$from_date'","to":"'$to_date'"}}'
+# 3. Validation
+if [ "$http_code" != "200" ]; then
+    printf '{"contributions":[],"total":0,"error":true,"errorMessage":"User not found or API error (HTTP %s)"}\n' "$http_code"
+    exit 1
+fi
 
-# Make API request with retry logic
-set MAX_RETRIES 5
-set RETRY_DELAY 3
-set attempt 1
+# 4. Process Data
+# We use jq to filter relevant days (>= start_date)
+relevant_days=$(echo "$body" | jq -c --arg start "$start_date" '.contributions[] | select(.date >= $start)')
 
-while test $attempt -le $MAX_RETRIES
-    # Execute curl
-    set temp_response (mktemp)
-    set http_code (curl -s -w "%{http_code}" -o "$temp_response" \\
-        -H "Authorization: Bearer $GITHUB_PAT" \\
-        -H "Content-Type: application/json" \\
-        -H "Accept: application/vnd.github.v4.idl" \\
-        -d "$payload" \\
-        https://api.github.com/graphql 2>/dev/null)
+total_contributions=0
+all_days=()
 
-    set body (cat "$temp_response")
-    rm -f "$temp_response"
+# Read filtered JSON lines
+while read -r day_json; do
+    if [ -z "$day_json" ]; then continue; fi
+    
+    date=$(echo "$day_json" | jq -r '.date')
+    count=$(echo "$day_json" | jq -r '.count')
+    level=$(echo "$day_json" | jq -r '.level')
+    
+    day_timestamp=$(date -d "$date" +%s)
+    
+    if [ "$day_timestamp" -le "$today_timestamp" ]; then
+        
+        case "$level" in
+            0) color="$COLOR_0" ;;
+            1) color="$COLOR_1" ;;
+            2) color="$COLOR_2" ;;
+            3) color="$COLOR_3" ;;
+            4) color="$COLOR_4" ;;
+            *) color="$COLOR_0" ;;
+        esac
 
-    # Check if successful
-    if test "$http_code" = "200"
-        # Check for GraphQL errors
-        set has_errors (echo "$body" | jq -r '.errors // empty' 2>/dev/null)
+        total_contributions=$((total_contributions + count))
 
-        if test -n "$has_errors"
-            # GraphQL returned errors
-            set error_msg (echo "$body" | jq -r '.errors[0].message' 2>/dev/null)
-            printf '{"contributions":[],"total":0,"error":true,"errorMessage":"GraphQL error: %s"}\n' "$error_msg"
-            exit 1
-        end
+        weekday=$(date -d "$date" +%w)
+        formatted_date=$(date -d "$date" +%m/%d)
+        
+        weekday_names=("Sun" "Mon" "Tue" "Wed" "Thu" "Fri" "Sat")
+        # Fix: Escape \${} to prevent JS interpolation
+        weekday_name="\${weekday_names[$weekday]}"
 
-        if test -z "$has_errors"
-            # Success! Process the data
-            set weeks_data (echo "$body" | jq -r '.data.user.contributionsCollection.contributionCalendar.weeks')
+        all_days+=("$date|$weekday|$count|$color|$formatted_date|$weekday_name")
+    fi
+done <<< "$relevant_days"
 
-            # Initialize arrays
-            set -l grid_json "["
-            set -l pill_json "["
-            set -l all_days
-            set total_contributions 0
-            set week_count 0
+# 5. Build Grid
+# Fix: Escape \${} to prevent JS interpolation
+IFS=$'\\n' sorted_days=($(sort <<<"\${all_days[*]}"))
+unset IFS
 
-            # Collect all days with their data
-            for week in (echo "$weeks_data" | jq -c '.[]')
-                for day in (echo "$week" | jq -c '.contributionDays[]')
-                    set date (echo "$day" | jq -r '.date')
-                    set count (echo "$day" | jq -r '.contributionCount')
-                    set weekday (echo "$day" | jq -r '.weekday')
+grid_json="["
+current_week="["
+current_week_day=-1
+first_week=1
+first_day_in_week=1
 
-                    # Check if date is in our range
-                    set day_timestamp (date -d "$date" +%s)
-                    set start_timestamp (date -d "$start_date" +%s)
-                    set today_timestamp (date -d "$today" +%s)
-
-                    if test $day_timestamp -ge $start_timestamp; and test $day_timestamp -le $today_timestamp
-                        # Determine color based on count
-                        if test $count -eq 0
-                            set color $COLOR_0
-                        else if test $count -le 3
-                            set color $COLOR_1
-                        else if test $count -le 6
-                            set color $COLOR_2
-                        else if test $count -le 9
-                            set color $COLOR_3
-                        else
-                            set color $COLOR_4
-                        end
-
-                        set total_contributions (math "$total_contributions + $count")
-
-                        # Store day data
-                        set formatted_date (date -d "$date" +%m/%d)
-                        set weekday_names "Sun" "Mon" "Tue" "Wed" "Thu" "Fri" "Sat"
-                        set weekday_index (math "$weekday + 1")
-                        set weekday_name $weekday_names[$weekday_index]
-
-                        # Add to all_days array (will be sorted by date)
-                        set -a all_days "$date|$weekday|$count|$color|$formatted_date|$weekday_name"
-                    end
-                end
-            end
-
-            # Sort days by date
-            set sorted_days (printf '%s\n' $all_days | sort)
-
-            # Build grid data (organized by week columns)
-            # Each week is Sun(0) through Sat(6)
-            set -l current_week "["
-            set -l current_week_day -1
-            set -l first_week 1
-            set -l first_day_in_week 1
-
-            for day_data in $sorted_days
-                set parts (string split "|" $day_data)
-                set date $parts[1]
-                set weekday $parts[2]
-                set count $parts[3]
-                set color $parts[4]
-                set formatted_date $parts[5]
-                set weekday_name $parts[6]
-
-                # If we hit Sunday (weekday 0) and it's not the first day, start new week
-                if test "$weekday" = "0"; and test $first_day_in_week -eq 0
-                    # Close previous week
-                    set current_week "$current_week]"
-                    if test $first_week -eq 1
-                        set grid_json "$grid_json$current_week"
-                        set first_week 0
-                    else
-                        set grid_json "$grid_json,$current_week"
-                    end
-                    set current_week "["
-                    set first_day_in_week 1
-                end
-
-                # Add day to current week
-                set day_obj "{\\\"weekday\\\":$weekday,\\\"weekdayName\\\":\\\"$weekday_name\\\",\\\"date\\\":\\\"$formatted_date\\\",\\\"count\\\":$count,\\\"color\\\":\\\"$color\\\"}"
-
-                if test $first_day_in_week -eq 1
-                    set current_week "$current_week$day_obj"
-                    set first_day_in_week 0
-                else
-                    set current_week "$current_week,$day_obj"
-                end
-            end
-
-            # Close last week
-            set current_week "$current_week]"
-            if test $first_week -eq 1
-                set grid_json "$grid_json$current_week"
-            else
-                set grid_json "$grid_json,$current_week"
-            end
-            set grid_json "$grid_json]"
-
-            # Build pill data (last 7 days)
-            set day_count (count $sorted_days)
-            set pill_start (math "max(1, $day_count - 6)")
-            set pill_count 0
-
-            for i in (seq $pill_start $day_count)
-                set day_data $sorted_days[$i]
-                set parts (string split "|" $day_data)
-                set weekday_name $parts[6]
-                set formatted_date $parts[5]
-                set count $parts[3]
-                set color $parts[4]
-
-                if test $pill_count -gt 0
-                    set pill_json "$pill_json,"
-                end
-                set pill_json "$pill_json{\\\"weekday\\\":\\\"$weekday_name\\\",\\\"date\\\":\\\"$formatted_date\\\",\\\"count\\\":$count,\\\"color\\\":\\\"$color\\\"}"
-                set pill_count (math "$pill_count + 1")
-            end
-            set pill_json "$pill_json]"
-
-            # Output final JSON
-            printf '{"contributions":%s,"gridData":%s,"total":%d,"error":false}\n' "$pill_json" "$grid_json" $total_contributions
-            exit 0
-        end
-    end
-
-    # Retry logic
-    if test $attempt -lt $MAX_RETRIES
-        sleep $RETRY_DELAY
-        set attempt (math "$attempt + 1")
-    else
-        # Max retries reached - provide specific error based on HTTP code
-        if test "$http_code" = "401"
-            printf '{"contributions":[],"total":0,"error":true,"errorMessage":"Authentication failed (HTTP 401). Check your PAT token."}\n'
-        else if test "$http_code" = "403"
-            printf '{"contributions":[],"total":0,"error":true,"errorMessage":"Rate limited or forbidden (HTTP 403). Try increasing refresh interval."}\n'
-        else if test "$http_code" = "404"
-            printf '{"contributions":[],"total":0,"error":true,"errorMessage":"User not found (HTTP 404). Check your GitHub username."}\n'
-        else if test "$http_code" = "000"
-            printf '{"contributions":[],"total":0,"error":true,"errorMessage":"Network error. Check internet connection."}\n'
+# Fix: Escape \${} to prevent JS interpolation
+for day_data in "\${sorted_days[@]}"; do
+    IFS='|' read -r date weekday count color formatted_date weekday_name <<< "$day_data"
+    
+    if [ "$weekday" == "0" ] && [ "$first_day_in_week" == "0" ]; then
+        current_week="$current_week]"
+        if [ "$first_week" == "1" ]; then
+            grid_json="$grid_json$current_week"
+            first_week=0
         else
-            printf '{"contributions":[],"total":0,"error":true,"errorMessage":"GitHub API error (HTTP %s) after %d attempts"}\n' "$http_code" $MAX_RETRIES
-        end
-        exit 1
-    end
-end
+            grid_json="$grid_json,$current_week"
+        fi
+        current_week="["
+        first_day_in_week=1
+    fi
 
-# Fallback error
-printf '{"contributions":[],"total":0,"error":true,"errorMessage":"Unknown error occurred"}\n'
-exit 1
+    day_obj="{\\\"weekday\\\":$weekday,\\\"weekdayName\\\":\\\"$weekday_name\\\",\\\"date\\\":\\\"$formatted_date\\\",\\\"count\\\":$count,\\\"color\\\":\\\"$color\\\"}"
+
+    if [ "$first_day_in_week" == "1" ]; then
+        current_week="$current_week$day_obj"
+        first_day_in_week=0
+    else
+        current_week="$current_week,$day_obj"
+    fi
+done
+
+current_week="$current_week]"
+if [ "$first_week" == "1" ]; then
+    grid_json="$grid_json$current_week"
+else
+    grid_json="$grid_json,$current_week"
+fi
+grid_json="$grid_json]"
+
+# 6. Build Pill Data
+# Fix: Escape \${} to prevent JS interpolation
+day_count=\${#sorted_days[@]}
+pill_start=$((day_count - 7))
+if [ $pill_start -lt 0 ]; then pill_start=0; fi
+
+pill_json="["
+pill_count=0
+
+for (( i=pill_start; i<day_count; i++ )); do
+    # Fix: Escape \${} to prevent JS interpolation
+    day_data="\${sorted_days[$i]}"
+    IFS='|' read -r date weekday count color formatted_date weekday_name <<< "$day_data"
+
+    if [ $pill_count -gt 0 ]; then
+        pill_json="$pill_json,"
+    fi
+    pill_json="$pill_json{\\\"weekday\\\":\\\"$weekday_name\\\",\\\"date\\\":\\\"$formatted_date\\\",\\\"count\\\":$count,\\\"color\\\":\\\"$color\\\"}"
+    pill_count=$((pill_count + 1))
+done
+pill_json="$pill_json]"
+
+printf '{"contributions":%s,"gridData":%s,"total":%d,"error":false}\\n' "$pill_json" "$grid_json" "$total_contributions"
+exit 0
 `
     }
 
-    // Fish process
+    // Bash process
     Process {
         id: githubProcess
-        command: ["/usr/bin/env", "fish", "-c", buildScript()]
+        command: ["/bin/bash", "-c", buildScript()]
         running: false
 
         stdout: SplitParser {
@@ -408,7 +318,6 @@ exit 1
 
                     if (result.error) {
                         console.error("GitHub: API error -", result.errorMessage)
-                        console.error("GitHub: Full response:", data)
                         root.isError = true
                         root.errorMessage = result.errorMessage || "Unknown error"
                         root.initializePlaceholders()
@@ -459,7 +368,7 @@ exit 1
                                 color: Theme.surfaceContainer
                             })
                         }
-                        newGridData.unshift(emptyWeek)  // Add empty weeks at start (older)
+                        newGridData.unshift(emptyWeek)
                     }
 
                     // Ensure each week has 7 days

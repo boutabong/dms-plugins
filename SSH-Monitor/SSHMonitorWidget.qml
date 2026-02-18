@@ -102,8 +102,8 @@ function extract_target
         if string match -q -- '-*' $arg
             # Single-char flag that takes a separate argument (e.g. -p 22)
             # Combined flags like -p22 are already skipped since they start with -
-            if string match -qr '^-[a-zA-Z]$' $arg
-                set flag_char (string sub -s 2 $arg)
+            if string match -qr -- '^-[a-zA-Z]$' $arg
+                set flag_char (string sub -s 2 -- $arg)
                 if contains $flag_char $flags_with_args
                     set skip_next true
                 end
@@ -137,7 +137,9 @@ for proc in $all_procs
 
     # SSH process
     if string match -q ssh $cmd
-        if string match -q '*-s*sftp' $proc
+        if string match -q '*rsync --server*' $proc
+            set conn_type RSYNC
+        else if string match -q '*-s*sftp' $proc
             set conn_type SFTP
         else
             set conn_type SSH
@@ -306,6 +308,7 @@ end
                                 if (text.indexOf("SSH") === 0) return "terminal";
                                 if (text.indexOf("SFTP") === 0) return "folder";
                                 if (text.indexOf("FTP") === 0) return "storage";
+                                if (text.indexOf("RSYNC") === 0) return "sync";
                                 if (text.indexOf("YAZI") === 0) return "sync";
                                 if (text.indexOf("REMOTE") === 0) return "sync";
                                 return "cloud_sync";
@@ -325,14 +328,6 @@ end
                 }
             }
 
-            StyledText {
-                visible: !root.hasConnections
-                width: parent.width
-                text: "No SSH, SFTP, or FTP connections detected"
-                font.pixelSize: Theme.fontSizeSmall
-                color: Theme.surfaceVariantText
-                horizontalAlignment: Text.AlignHCenter
-            }
         }
     }
 }

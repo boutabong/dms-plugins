@@ -18,18 +18,18 @@ Display your weekly GitHub contribution activity directly in your status bar.
 - Weekly contribution totals
 - Manual refresh with notifications
 - Open GitHub profile directly from widget
+- **No API Token required** (uses public API)
 
 **Settings**
 | Setting | Description |
 |---------|-------------|
 | GitHub Username | Your GitHub username |
-| Personal Access Token | Fine-grained PAT with repository read access |
 | Refresh Interval | How often to fetch data (seconds) |
 
 **Dependencies**
+- bash
 - curl
 - jq
-- fish
 - libnotify
 - xdg-utils
 
