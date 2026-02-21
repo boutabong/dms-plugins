@@ -308,7 +308,7 @@ exit 0
     // Bash process
     Process {
         id: githubProcess
-        command: ["/bin/bash", "-c", buildScript()]
+        command: ["/usr/bin/env", "bash", "-c", buildScript()]
         running: false
 
         stdout: SplitParser {
