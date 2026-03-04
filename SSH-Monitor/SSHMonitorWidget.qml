@@ -16,7 +16,7 @@ PluginComponent {
     property bool hasConnections: connections.length > 0
 
     // Settings from pluginData (convert seconds to milliseconds)
-    property int refreshInterval: (pluginData.refreshInterval || 5) * 1000
+    property int refreshInterval: (pluginData.refreshInterval || 2) * 1000
 
     // Icons
     readonly property string iconDisconnected: "cloud_off"
@@ -31,212 +31,217 @@ PluginComponent {
 
     Process {
         id: connectionChecker
-        command: ["/usr/bin/env", "fish", "-c", fishScript]
+        command: ["/bin/bash", "-c", bashScript]
         running: false
 
-        property string fishScript: `
-#!/usr/bin/env fish
-# Get all connection processes
-set ssh_procs (pgrep -af '^ssh ' 2>/dev/null)
-set sftp_procs (pgrep -af '^sftp ' 2>/dev/null)
-set ftp_procs (pgrep -af '^ftp ' 2>/dev/null)
+        property string bashScript: `
+# Get all SSH/SFTP/FTP connection processes in one call
+mapfile -t all_procs < <(pgrep -af '^(ssh|sftp|ftp) ' 2>/dev/null)
 
-# Combine all processes
-set all_procs $ssh_procs $sftp_procs $ftp_procs
+# Parse SSH config into an associative array for O(1) lookup
+declare -A config_map
+current_host=""
+if [[ -f ~/.ssh/config ]]; then
+    while IFS= read -r line; do
+        if [[ "$line" =~ ^Host[[:space:]]+([^*[:space:]]+) ]]; then
+            current_host="\${BASH_REMATCH[1]}"
+        elif [[ "$line" =~ ^[[:space:]]*HostName[[:space:]]+([^[:space:]]+) ]] && [[ -n "$current_host" ]]; then
+            host_addr="\${BASH_REMATCH[1]}"
+            config_map["$host_addr"]="$current_host"
+            config_map["$current_host"]="$current_host"
+        fi
+    done < ~/.ssh/config
+fi
 
-# Parse SSH config
-set -l config_map
-if test -f ~/.ssh/config
-    set current_host ""
-    for line in (cat ~/.ssh/config)
-        if string match -qr '^Host\\s+(\\S+)' $line
-            set host (string match -r '^Host\\s+(\\S+)' $line)[2]
-            if test "$host" != "*"
-                set current_host $host
-            end
-        else if string match -qr '^\\s*HostName\\s+(\\S+)' $line
-            if test -n "$current_host"
-                set host_addr (string match -r '^\\s*HostName\\s+(\\S+)' $line)[2]
-                set -a config_map "$host_addr|$current_host"
-                set -a config_map "$current_host|$current_host"
-            end
-        end
-    end
-end
+# Check if a value exists in an array
+contains() {
+    local needle="$1"
+    shift
+    local item
+    for item in "$@"; do
+        [[ "$item" == "$needle" ]] && return 0
+    done
+    return 1
+}
 
-# Resolve target
-function resolve_target
-    set target $argv[1]
-    set config_map $argv[2..]
-    for mapping in $config_map
-        set parts (string split '|' $mapping)
-        if test "$parts[1]" = "$target"
-            echo $parts[2]
-            return
-        end
-    end
-    echo $target
-end
-
-# Extract target hostname from command args
-# Properly skips flags that take separate arguments
-function extract_target
-    set cmd_name $argv[1]
-    set args $argv[2..]
-
-    # Flags that take a separate argument (superset of ssh/sftp/ftp)
-    set flags_with_args b B c D E e F I i J L l m O o P p Q R S s W w
-
-    set skip_next false
-    for arg in $args
-        if $skip_next
-            set skip_next false
+# Extract connection target from command args into globals:
+#   _ext_user  — user part from user@host (empty if not given)
+#   _ext_host  — hostname or IP
+#   _ext_port  — explicit port value (empty if not given)
+# Skips flags that consume the next argument; captures -p/-P port values.
+_ext_user="" _ext_host="" _ext_port=""
+extract_target() {
+    _ext_user="" _ext_host="" _ext_port=""
+    local flags_with_args="b B c D E e F I i J L l m O o P p Q R S s W w"
+    local skip_next=false
+    local next_is_port=false
+    local arg
+    for arg in "$@"; do
+        if $skip_next; then
+            skip_next=false
+            if $next_is_port; then
+                _ext_port="$arg"
+                next_is_port=false
+            fi
             continue
-        end
-
-        # Skip the command name itself
-        if test "$arg" = "$cmd_name"; or test "$arg" = "$cmd_name:"
+        fi
+        if [[ "$arg" == -* ]]; then
+            if [[ "$arg" =~ ^-[pP]([0-9]+)$ ]]; then
+                _ext_port="\${BASH_REMATCH[1]}"
+            elif [[ "$arg" =~ ^-[a-zA-Z]$ ]]; then
+                local flag_char="\${arg:1:1}"
+                if [[ " $flags_with_args " == *" $flag_char "* ]]; then
+                    skip_next=true
+                    if [[ "$flag_char" == "p" || "$flag_char" == "P" ]]; then
+                        next_is_port=true
+                    fi
+                fi
+            fi
             continue
-        end
-
-        if string match -q -- '-*' $arg
-            # Single-char flag that takes a separate argument (e.g. -p 22)
-            # Combined flags like -p22 are already skipped since they start with -
-            if string match -qr -- '^-[a-zA-Z]$' $arg
-                set flag_char (string sub -s 2 -- $arg)
-                if contains $flag_char $flags_with_args
-                    set skip_next true
-                end
-            end
-            continue
-        end
-
-        # First non-flag, non-command arg is the target
-        if string match -q '*@*' $arg
-            echo (string split '@' $arg)[2]
+        fi
+        if [[ "$arg" == *@* ]]; then
+            _ext_user="\${arg%%@*}"
+            _ext_host="\${arg#*@}"
         else
-            echo $arg
-        end
+            _ext_host="$arg"
+        fi
         return
-    end
-end
+    done
+}
+
+# Collect active sftp-sync processes up front (pid → profile).
+# Used both to build REMOTE entries and to know when to suppress
+# the underlying sshfs SSH child from appearing as a duplicate SFTP entry.
+declare -A sftp_sync_pids
+while IFS= read -r proc; do
+    [[ -z "$proc" ]] && continue
+    read -ra f <<< "$proc"
+    if [[ "\${#f[@]}" -ge 4 && "\${f[1]}" == *sftp-sync ]]; then
+        sftp_sync_pids["\${f[0]}"]="\${f[3]}"
+    fi
+done < <(pgrep -af 'sftp-sync' 2>/dev/null)
+
+# When sftp-sync is active, read /proc/mounts to find all sshfs-mounted hosts.
+# Any SSH connection whose resolved host matches an sshfs mount is the
+# underlying FUSE connection — already represented by the REMOTE entry below,
+# so it should not appear as a duplicate SFTP entry.
+# NOTE: PPID-based detection is unreliable here because sshfs forks to
+# daemonize *after* spawning its SSH child, reparenting that child to PID 1.
+declare -A sshfs_hosts
+if [[ "\${#sftp_sync_pids[@]}" -gt 0 ]]; then
+    while IFS= read -r line; do
+        if [[ "$line" == *" fuse.sshfs "* ]]; then
+            src="\${line%% *}"
+            host="\${src##*@}"
+            host="\${host%%:*}"
+            [[ -n "$host" ]] && sshfs_hosts["\${config_map[$host]:-$host}"]=1
+        fi
+    done < /proc/mounts
+fi
 
 # Build connection list
-set connections
-for proc in $all_procs
-    set fields (string split -n ' ' $proc)
-    if test (count $fields) -lt 2
+connections=()
+declare -A conn_counts
+for proc in "\${all_procs[@]}"; do
+    read -ra fields <<< "$proc"
+    if [[ "\${#fields[@]}" -lt 3 ]]; then
         continue
-    end
-    
-    set cmd_and_args $fields[2..]
-    set cmd $fields[2]
-    
-    set conn_type SSH
-    set target ""
-
-    # SSH process
-    if string match -q ssh $cmd
-        if string match -q '*rsync --server*' $proc
-            set conn_type RSYNC
-        else if string match -q '*-s*sftp' $proc
-            set conn_type SFTP
+    fi
+    cmd="\${fields[1]}"
+    conn_type="SSH"
+    if [[ "$cmd" == "ssh" ]]; then
+        if [[ "$proc" == *"rsync --server"* ]]; then
+            conn_type="RSYNC"
+        elif [[ "$proc" == *"-s"*"sftp"* ]]; then
+            conn_type="SFTP"
+        fi
+    elif [[ "$cmd" == "sftp" ]]; then
+        conn_type="SFTP"
+    elif [[ "$cmd" == "ftp" ]]; then
+        conn_type="FTP"
+    fi
+    extract_target "\${fields[@]:2}"
+    [[ -z "$_ext_host" ]] && continue
+    # Known SSH config host → use clean alias; unknown host → show user@host:port
+    if [[ -n "\${config_map[$_ext_host]+x}" ]]; then
+        resolved="\${config_map[$_ext_host]}"
+        display_host="$resolved"
+    else
+        resolved="$_ext_host"
+        display_host="$_ext_host"
+        [[ -n "$_ext_user" ]] && display_host="$_ext_user@$display_host"
+        [[ -n "$_ext_port" && "$_ext_port" != "22" ]] && display_host="$display_host:$_ext_port"
+    fi
+    [[ -n "\${sshfs_hosts[$resolved]+x}" ]] && continue
+    conn_string="$conn_type → $display_host"
+    if [[ "$conn_type" == "SSH" || "$conn_type" == "SFTP" || "$conn_type" == "FTP" ]]; then
+        if [[ -n "\${conn_counts[$conn_string]+x}" ]]; then
+            conn_counts["\${conn_string}"]=\$(( \${conn_counts[$conn_string]} + 1 ))
         else
-            set conn_type SSH
-        end
-        set target (extract_target ssh $cmd_and_args)
-    # SFTP command
-    else if string match -q sftp $cmd
-        set conn_type SFTP
-        set target (extract_target sftp $cmd_and_args)
-    # FTP command
-    else if string match -q ftp $cmd
-        set conn_type FTP
-        set target (extract_target ftp $cmd_and_args)
-    end
-    
-    # Skip if no valid target
-    if test -z "$target"
-        continue
-    end
-    
-    # Resolve target
-    set resolved (resolve_target $target $config_map)
-    
-    # Add to connections (avoid duplicates)
-    set conn_string "$conn_type → $resolved"
-    if not contains $conn_string $connections
-        set -a connections $conn_string
-    end
-end
+            conn_counts["$conn_string"]=1
+            connections+=("$conn_string")
+        fi
+    else
+        if ! contains "$conn_string" "\${connections[@]}"; then
+            connections+=("$conn_string")
+        fi
+    fi
+done
 
-# Check for running sftp-sync processes
-set sftp_sync_procs (pgrep -af 'sftp-sync' 2>/dev/null)
-for proc in $sftp_sync_procs
-    set fields (string split -n ' ' $proc)
-    if test (count $fields) -ge 4
-        set cmd_path $fields[2]
-        # Check if it's the sftp-sync binary
-        if string match -q '*sftp-sync' $cmd_path
-            set profile $fields[4]
-            if test -n "$profile"
-                set conn_string "REMOTE → $profile"
-                if not contains $conn_string $connections
-                    set -a connections $conn_string
-                end
-            end
-        end
-    end
-end
+# Add REMOTE entries from the already-collected sftp-sync data
+for pid in "\${!sftp_sync_pids[@]}"; do
+    profile="\${sftp_sync_pids[$pid]}"
+    if [[ -n "$profile" ]]; then
+        conn_string="REMOTE → $profile"
+        if ! contains "$conn_string" "\${connections[@]}"; then
+            connections+=("$conn_string")
+        fi
+    fi
+done
 
 # Check for Yazi VFS SFTP connections
-set yazi_pids (pgrep yazi 2>/dev/null)
-for pid in $yazi_pids
-    # Get remote IPs from ESTABLISHED connections to port 22
-    for remote_ip in (ss -tnp 2>/dev/null | awk -v pid="pid=$pid," '$1=="ESTAB" && $0 ~ pid && $5 ~ /:22$/ {sub(/:22$/,"",$5); print $5}')
-        if test -n "$remote_ip"
-            # Resolve IP using SSH config mapping
-            set resolved (resolve_target $remote_ip $config_map)
-            set conn_string "YAZI → $resolved"
-            if not contains $conn_string $connections
-                set -a connections $conn_string
-            end
-        end
-    end
-end
+while IFS= read -r pid; do
+    [[ -z "$pid" ]] && continue
+    while IFS= read -r remote_ip; do
+        [[ -z "$remote_ip" ]] && continue
+        resolved="\${config_map[$remote_ip]:-$remote_ip}"
+        conn_string="YAZI → $resolved"
+        if ! contains "$conn_string" "\${connections[@]}"; then
+            connections+=("$conn_string")
+        fi
+    done < <(ss -tnp 2>/dev/null | awk -v pid="pid=$pid," '$1=="ESTAB" && $0 ~ pid && $5 ~ /:22$/ {sub(/:22$/,"",$5); print $5}')
+done < <(pgrep yazi 2>/dev/null)
 
 # Output
-if test (count $connections) -eq 0
+if [[ "\${#connections[@]}" -eq 0 ]]; then
     echo "DISCONNECTED"
 else
-    for conn in $connections
-        echo $conn
-    end
-end
+    for conn in "\${connections[@]}"; do
+        if [[ -n "\${conn_counts[$conn]+x}" && "\${conn_counts[$conn]}" -gt 1 ]]; then
+            echo "$conn ×\${conn_counts[$conn]}"
+        else
+            echo "$conn"
+        fi
+    done
+fi
 `
-        
+
         stdout: SplitParser {
             onRead: data => {
-                // Accumulate output - don't update connections yet
                 root.processOutput += data + '\n';
             }
         }
 
         onExited: (exitCode, exitStatus) => {
-            // Now process all accumulated output
             var lines = root.processOutput.trim().split('\n');
             var newConnections = [];
-
             for (var i = 0; i < lines.length; i++) {
                 var line = lines[i].trim();
-                if (line === "" || line === "DISCONNECTED") {
-                    continue;
-                }
+                if (line === "" || line === "DISCONNECTED") continue;
                 newConnections.push(line);
             }
-
             root.connections = newConnections;
-            root.processOutput = ""; // Reset for next run
+            root.processOutput = "";
         }
     }
 
@@ -247,7 +252,8 @@ end
         repeat: true
         triggeredOnStart: true
         onTriggered: {
-            connectionChecker.running = true
+            if (!connectionChecker.running)
+                connectionChecker.running = true
         }
     }
 
@@ -274,9 +280,15 @@ end
         PopoutComponent {
             id: popoutColumn
             headerText: "SSH Monitor"
-            detailsText: root.hasConnections
-                ? root.connections.length + " active connection" + (root.connections.length !== 1 ? "s" : "")
-                : "No active connections"
+            detailsText: {
+                if (!root.hasConnections) return "No active connections";
+                var total = 0;
+                for (var i = 0; i < root.connections.length; i++) {
+                    var m = root.connections[i].match(/×(\d+)$/);
+                    total += m ? parseInt(m[1]) : 1;
+                }
+                return total + " active connection" + (total !== 1 ? "s" : "");
+            }
             showCloseButton: true
 
             ListView {

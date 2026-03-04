@@ -43,19 +43,22 @@ Monitor active SSH, SFTP, FTP, and Yazi VFS connections with hostname resolution
 ![SSH Monitor Popout](screenshots/sshmonitor-popout.png)
 
 **Features**
-- Detects SSH, SFTP, FTP, and Yazi connections
+- Detects SSH, SFTP, FTP, Yazi, and sftp-sync (REMOTE) connections
 - Resolves hostnames via SSH config
+- Unknown hosts displayed as `user@host:port`
+- Tracks multiple connections to the same host (×N)
 - Real-time connection status
 - Connection type indicators
 
 **Settings**
 | Setting | Description |
 |---------|-------------|
-| Refresh Interval | How often to check for connections (seconds) |
+| Refresh Interval | How often to check for connections (1–15 seconds) |
 
 **Dependencies**
-- fish
+- bash
 - procps-ng
+- iproute2
 
 ---
 

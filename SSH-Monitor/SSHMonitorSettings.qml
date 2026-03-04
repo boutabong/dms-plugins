@@ -27,9 +27,9 @@ PluginSettings {
         settingKey: "refreshInterval"
         label: "Refresh Interval"
         description: "How often to check for active connections"
-        defaultValue: 5
-        minimum: 5
-        maximum: 60
+        defaultValue: 2
+        minimum: 1
+        maximum: 15
         unit: "sec"
     }
 }
